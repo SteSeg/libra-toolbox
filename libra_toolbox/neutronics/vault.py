@@ -53,7 +53,9 @@ def build_vault_model(
     try:
         import openmc
         import openmc.model
-        import openmc_data_downloader as odd
+        import os
+        if "OPENMC_CROSS_SECTIONS" not in os.environ:
+            import openmc_data_downloader as odd
     except ModuleNotFoundError:
         raise ModuleNotFoundError("openmc and openmc_data_downloader are required.")
 
