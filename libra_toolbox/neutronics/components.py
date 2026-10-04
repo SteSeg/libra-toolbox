@@ -42,6 +42,45 @@ class LeadBrick(Component):
 
         return [cell]
 
+@dataclass
+class GeneratorSupport(Component):
+    """Support structure for the neutron generator."""
+
+    width: float = 2.54
+    length: float = 2.54
+    height: float = 2.54
+
+    separation: float = 10.0
+
+    material: openmc.Material = None
+
+    def geometry(self):
+        """Build the two generator support blocks."""
+
+        cells = []
+
+        for i, y in enumerate(
+            (-self.separation / 2, self.separation / 2),
+            start=1,
+        ):
+            box = openmc.model.RectangularParallelepiped(
+                -self.width / 2,
+                +self.width / 2,
+                y - self.length / 2,
+                y + self.length / 2,
+                0.0,
+                self.height,
+            )
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{i}",
+                    region=-box,
+                    fill=self.material,
+                )
+            )
+
+        return cells
 
 @dataclass
 class Vessel1L(Component):
@@ -128,7 +167,7 @@ class InsulatorLagging(Component):
 
 
 @dataclass
-class Firebrick(Component):
+class Furnace(Component):
     inner_radius: float = 9.144
     outer_radius: float = 12.002
     thickness: float = 15.24
@@ -237,111 +276,38 @@ class Table(Component):
 
 @dataclass
 class Breeder(Component):
-    """Breeder material filling the interior of a Vessel.
-
-    The Breeder amount can be specified either by mass or by volume.
-    The Vessel is responsible for defining the available internal
-    volume and accounting for internal structures/obstructions.
-
-    Parameters
-    ----------
-    density : float
-        Breeder density [g/cm3].
-    mass : float, optional
-        Total Breeder mass [g].
-    volume : float, optional
-        Total Breeder volume [cm3].
-    material : openmc.Material, optional
-        OpenMC material used to fill the Breeder region.
-    fill_direction : str
-        Direction in which the material fills the vessel.
-        Currently only ``"z"`` is supported.
-    """
-
     density: float
-    mass: Optional[float] = None
-    volume: Optional[float] = None
-    material: Optional[openmc.Material] = None
-    fill_direction: str = "z"
+    mass: float | None = None
+    volume: float | None = None
+    material: openmc.Material | None = None
 
-    def __post_init__(self):
-        if self.mass is None and self.volume is None:
-            raise ValueError(
-                "Breeder requires either 'mass' or 'volume'."
-            )
+    def region(self, vessel):
+        fill_height = vessel.height_for_volume(
+            self.requested_volume
+        )
 
-        if self.mass is not None and self.volume is not None:
-            raise ValueError(
-                "Specify either 'mass' or 'volume', not both."
-            )
+        bottom = openmc.ZPlane(z0=vessel.fill_bottom)
+        top = openmc.ZPlane(
+            z0=vessel.fill_bottom + fill_height
+        )
 
-        if self.density <= 0:
-            raise ValueError("Breeder density must be positive.")
-
-        if self.mass is not None and self.mass <= 0:
-            raise ValueError("Breeder mass must be positive.")
-
-        if self.volume is not None and self.volume <= 0:
-            raise ValueError("Breeder volume must be positive.")
-
-        if self.fill_direction != "z":
-            raise NotImplementedError(
-                "Only fill_direction='z' is currently supported."
-            )
+        return (
+            vessel.fill_region
+            & +bottom
+            & -top
+        )
 
     @property
-    def requested_volume(self) -> float:
-        """Requested Breeder volume [cm3]."""
+    def requested_volume(self):
         if self.volume is not None:
             return self.volume
 
         return self.mass / self.density
 
     def geometry(self, vessel):
-        """Build the Breeder OpenMC geometry inside ``vessel``.
-
-        Parameters
-        ----------
-        vessel : Vessel
-            Vessel containing the Breeder.
-
-        Returns
-        -------
-        list[openmc.Cell]
-            OpenMC cells representing the Breeder.
-        """
-
-        if self.material is None:
-            raise ValueError(
-                "Breeder requires an OpenMC material."
-            )
-
-        # Ask the vessel to determine the height required to contain
-        # the requested volume while respecting its internal geometry.
-        fill_height = vessel.height_for_volume(
-            self.requested_volume
-        )
-
-        # Vessel provides the actual available internal region,
-        # already excluding walls and internal structures.
-        fill_region = vessel.fill_region
-
-        # Restrict the fill to the required height.
-        z_bottom = vessel.fill_bottom
-        z_top = z_bottom + fill_height
-
-        bottom = openmc.ZPlane(z0=z_bottom)
-        top = openmc.ZPlane(z0=z_top)
-
-        region = (
-            fill_region
-            & +bottom
-            & -top
-        )
-
         cell = openmc.Cell(
             name=self.name,
-            region=region,
+            region=self.region(vessel),
             fill=self.material,
         )
 
@@ -349,55 +315,15 @@ class Breeder(Component):
 
 @dataclass
 class HeadSpace(Component):
-    """Head-space region inside a Vessel not occupied by the Breeder.
-
-    By default, the HeadSpace fills all of the available vessel volume
-    left unoccupied by the Breeder.
-
-    Parameters
-    ----------
-    material : openmc.Material
-        Material filling the head-space region, e.g. helium.
-    """
-
     material: openmc.Material
 
+    def region(self, vessel, breeder):
+        return vessel.fill_region & ~breeder.region(vessel)
+
     def geometry(self, vessel, breeder):
-        """Build the head-space geometry inside ``vessel``.
-
-        Parameters
-        ----------
-        vessel : Vessel
-            Vessel containing the Breeder and head space.
-        breeder : Breeder
-            Breeder component occupying part of the vessel volume.
-
-        Returns
-        -------
-        list[openmc.Cell]
-            OpenMC cells representing the head space.
-        """
-
-        # Entire volume available for contents of the vessel.
-        vessel_region = vessel.fill_region
-
-        # Region occupied by the Breeder.
-        breeder_cells = breeder.geometry(vessel)
-
-        if len(breeder_cells) != 1:
-            raise ValueError(
-                "HeadSpace currently expects Breeder to produce "
-                "exactly one OpenMC cell."
-            )
-
-        breeder_region = breeder_cells[0].region
-
-        # Everything inside the vessel that is not the Breeder.
-        headspace_region = vessel_region & ~breeder_region
-
         cell = openmc.Cell(
             name=self.name,
-            region=headspace_region,
+            region=self.region(vessel, breeder),
             fill=self.material,
         )
 
@@ -461,3 +387,92 @@ class OuterVessel(Component):
         )
 
         return [cell]
+
+@dataclass
+class OuterVesselSweepGas(Component):
+    """Sweep gas filling the region inside the outer vessel but
+    outside the inner Vessel1L and Furnace.
+
+    Parameters
+    ----------
+    material : openmc.Material
+        Material filling the sweep-gas region.
+    """
+
+    material: openmc.Material
+
+    def region(
+        self,
+        outer_vessel,
+        vessel_1l,
+        furnace=None,
+    ):
+        """Return the sweep-gas region."""
+
+        # Start with the entire internal volume of the outer vessel.
+        region = outer_vessel.fill_region
+
+        # Exclude the inner Vessel1L.
+        region &= ~vessel_1l.region
+
+        # Exclude the Furnace, if present.
+        if furnace is not None:
+            region &= ~furnace.region
+
+        return region
+
+    def geometry(
+        self,
+        outer_vessel,
+        vessel_1l,
+        furnace=None,
+    ):
+        """Build the OpenMC sweep-gas cell."""
+
+        region = self.region(
+            outer_vessel=outer_vessel,
+            vessel_1l=vessel_1l,
+            furnace=furnace,
+        )
+
+        cell = openmc.Cell(
+            name=self.name,
+            region=region,
+            fill=self.material,
+        )
+
+        return [cell]
+
+class BreederVessel1LAssembly(Component):
+
+    def geometry(self):
+
+        vessel_region = self.vessel.fill_region
+
+        breeder_region = self.breeder.region(
+            vessel_region
+        )
+
+        headspace_region = (
+            vessel_region
+            & ~breeder_region
+        )
+
+        vessel_cells = self.vessel.geometry()
+
+        breeder_cell = openmc.Cell(
+            name=self.breeder.name,
+            region=breeder_region,
+            fill=self.breeder.material,
+        )
+
+        headspace_cell = openmc.Cell(
+            name=self.headspace.name,
+            region=headspace_region,
+            fill=self.headspace.material,
+        )
+
+        return (
+            vessel_cells
+            + [breeder_cell, headspace_cell]
+        )
