@@ -2,9 +2,11 @@ from dataclasses import dataclass
 from typing import Tuple, Optional
 import openmc
 import materials
+import numpy as np
+from scipy.optimize import brentq
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Component:
     """Base experiment component.
 
@@ -14,7 +16,6 @@ class Component:
     name: str
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     rotation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
-    material: Optional[openmc.Material] = None
 
 
 @dataclass
@@ -52,7 +53,7 @@ class GeneratorSupport(Component):
 
     separation: float = 10.0
 
-    material: openmc.Material = None
+    material: openmc.Material = materials.HDPE
 
     def geometry(self):
         """Build the two generator support blocks."""
@@ -81,68 +82,6 @@ class GeneratorSupport(Component):
             )
 
         return cells
-
-@dataclass
-class Vessel1L(Component):
-    radius: float = 12.853
-    external_radius: float = 13.272
-
-    base_thickness: float = 0.786
-    height: float = 21.093
-    cover_thickness: float = 2.392
-    material: openmc.Material = materials.Inconel625
-
-    def geometry(self):
-        # Local coordinate system:
-        # origin = center of vessel at its bottom
-        # z = vessel axis
-
-        z_bottom = 0.0
-        z_top = self.base_thickness + self.height + self.cover_thickness
-
-        z_base = openmc.ZPlane(z0=z_bottom)
-        z_vessel_bottom = openmc.ZPlane(z0=self.base_thickness)
-        z_vessel_top = openmc.ZPlane(
-            z0=self.base_thickness + self.height
-        )
-        z_top = openmc.ZPlane(z0=z_top)
-
-        inner = openmc.ZCylinder(r=self.radius)
-        outer = openmc.ZCylinder(r=self.external_radius)
-
-        base_region = (
-            +z_base
-            & -z_vessel_bottom
-            & -outer
-        )
-
-        cylindrical_region = (
-            +z_vessel_bottom
-            & -z_vessel_top
-            & +inner
-            & -outer
-        )
-
-        cover_region = (
-            +z_vessel_top
-            & -z_top
-            & -outer
-        )
-
-        region = (
-            base_region
-            | cylindrical_region
-            | cover_region
-        )
-
-        cell = openmc.Cell(
-            name=self.name,
-            region=region,
-            fill=self.material,
-        )
-
-        return [cell]
-
 
 @dataclass
 class InsulatorLagging(Component):
@@ -274,19 +213,146 @@ class Table(Component):
 
         return [cell]
 
+
+@dataclass
+class Vessel1L(Component):
+    radius: float = 12.853
+    external_radius: float = 13.272
+
+    base_thickness: float = 0.786
+    height: float = 21.093
+    cover_thickness: float = 2.392
+
+    material: openmc.Material = None
+
+    @property
+    def fill_bottom(self):
+        return self.base_thickness
+
+    @property
+    def fill_top(self):
+        return self.base_thickness + self.height
+
+    @property
+    def fill_region(self):
+        inner = openmc.ZCylinder(r=self.radius)
+
+        bottom = openmc.ZPlane(z0=self.fill_bottom)
+        top = openmc.ZPlane(z0=self.fill_top)
+
+        return +bottom & -top & -inner
+
+    def geometry(self):
+        outer = openmc.ZCylinder(r=self.external_radius)
+        inner = openmc.ZCylinder(r=self.radius)
+
+        bottom = openmc.ZPlane(z0=0.0)
+        wall_bottom = openmc.ZPlane(z0=self.fill_bottom)
+        wall_top = openmc.ZPlane(z0=self.fill_top)
+        top = openmc.ZPlane(
+            z0=self.fill_top + self.cover_thickness
+        )
+
+        bottom_region = (
+            +bottom
+            & -wall_bottom
+            & -outer
+        )
+
+        wall_region = (
+            +wall_bottom
+            & -wall_top
+            & +inner
+            & -outer
+        )
+
+        top_region = (
+            +wall_top
+            & -top
+            & -outer
+        )
+
+        cell = openmc.Cell(
+            name=self.name,
+            region=(
+                bottom_region
+                | wall_region
+                | top_region
+            ),
+            fill=self.material,
+        )
+
+        return [cell]
+
+    def volume_below(self, z):
+        """Available vessel volume below z [cm3]."""
+
+        z = np.clip(
+            z,
+            self.fill_bottom,
+            self.fill_top,
+        )
+
+        height = z - self.fill_bottom
+
+        # Simple vessel for now.
+        return np.pi * self.radius**2 * height
+
+    def height_for_volume(self, volume):
+        """Return the fill height corresponding to a volume [cm3]."""
+
+        if volume <= 0:
+            raise ValueError("Volume must be positive.")
+
+        total_volume = self.volume_below(self.fill_top)
+
+        if volume > total_volume:
+            raise ValueError(
+                f"Requested volume ({volume:.3f} cm3) exceeds "
+                f"the available vessel volume ({total_volume:.3f} cm3)."
+            )
+
+        z = brentq(
+            lambda z: self.volume_below(z) - volume,
+            self.fill_bottom,
+            self.fill_top,
+        )
+
+        return z - self.fill_bottom
+    
 @dataclass
 class Breeder(Component):
-    density: float
+    material: openmc.Material
+
+    density: float | None = None
     mass: float | None = None
     volume: float | None = None
-    material: openmc.Material | None = None
+
+    @property
+    def requested_volume(self):
+        if self.volume is not None:
+            return self.volume
+
+        if self.mass is not None:
+            if self.density is None:
+                raise ValueError(
+                    "Density is required when mass is specified."
+                )
+            return self.mass / self.density
+
+        raise ValueError(
+            "Specify either volume or mass."
+        )
 
     def region(self, vessel):
         fill_height = vessel.height_for_volume(
             self.requested_volume
         )
 
-        bottom = openmc.ZPlane(z0=vessel.fill_bottom)
+        bottom = openmc.ZPlane(
+            z0=vessel.fill_bottom
+        )
+
         top = openmc.ZPlane(
             z0=vessel.fill_bottom + fill_height
         )
@@ -297,37 +363,10 @@ class Breeder(Component):
             & -top
         )
 
-    @property
-    def requested_volume(self):
-        if self.volume is not None:
-            return self.volume
-
-        return self.mass / self.density
-
-    def geometry(self, vessel):
-        cell = openmc.Cell(
-            name=self.name,
-            region=self.region(vessel),
-            fill=self.material,
-        )
-
-        return [cell]
-
 @dataclass
-class HeadSpace(Component):
+class HeadSpace:
+    name: str
     material: openmc.Material
-
-    def region(self, vessel, breeder):
-        return vessel.fill_region & ~breeder.region(vessel)
-
-    def geometry(self, vessel, breeder):
-        cell = openmc.Cell(
-            name=self.name,
-            region=self.region(vessel, breeder),
-            fill=self.material,
-        )
-
-        return [cell]
 
 
 @dataclass
@@ -443,22 +482,23 @@ class OuterVesselSweepGas(Component):
 
         return [cell]
 
-class BreederVessel1LAssembly(Component):
+from dataclasses import dataclass
+import openmc
+
+
+@dataclass
+class BreederVessel1LAssembly:
+    name: str
+    vessel: Vessel1L
+    breeder: Breeder
+    headspace: HeadSpace
 
     def geometry(self):
-
-        vessel_region = self.vessel.fill_region
-
-        breeder_region = self.breeder.region(
-            vessel_region
-        )
-
-        headspace_region = (
-            vessel_region
-            & ~breeder_region
-        )
-
+        # Vessel structure
         vessel_cells = self.vessel.geometry()
+
+        # Breeder region inside the vessel
+        breeder_region = self.breeder.region(self.vessel)
 
         breeder_cell = openmc.Cell(
             name=self.breeder.name,
@@ -466,13 +506,16 @@ class BreederVessel1LAssembly(Component):
             fill=self.breeder.material,
         )
 
+        # Everything inside the vessel not occupied by breeder
+        headspace_region = self.vessel.fill_region & ~breeder_region
+
         headspace_cell = openmc.Cell(
             name=self.headspace.name,
             region=headspace_region,
             fill=self.headspace.material,
         )
 
-        return (
-            vessel_cells
-            + [breeder_cell, headspace_cell]
-        )
+        return vessel_cells + [
+            breeder_cell,
+            headspace_cell,
+        ]
