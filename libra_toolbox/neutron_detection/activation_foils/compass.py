@@ -663,6 +663,7 @@ class SampleMeasurement(Measurement):
         search_width: float = 800,
         summing_method: str = 'sum_gaussian',
         efficiency_function = None,
+        efficiency_function_kwargs: dict = None
     ):
         """
         Estimate the emitted gamma-ray counts for the foil product nuclide.
@@ -699,6 +700,9 @@ class SampleMeasurement(Measurement):
             efficiency coefficients provided in ``efficiency_coeffs``. 
             This is useful when efficiency is known from
             calibration data or a fitted model instead of a simple polynomial.
+        efficiency_function_kwargs : dict, optional
+            Additional keyword arguments to pass to ``efficiency_function`` if
+            it requires extra parameters.
 
         Returns
         -------
@@ -711,7 +715,7 @@ class SampleMeasurement(Measurement):
         The effective detection efficiency is determined as follows:
 
         - If ``efficiency_function`` is not ``None``, then
-          ``detection_efficiency = efficiency_function(energy)``.
+          ``detection_efficiency = efficiency_function(energy, **efficiency_function_kwargs)``.
         - Otherwise, ``detection_efficiency = np.polyval(efficiency_coeffs, energy)``.
 
         The quantity returned is therefore:
@@ -748,7 +752,7 @@ class SampleMeasurement(Measurement):
 
         # check if there is an efficiency function provided, if so use it to get the detection efficiency
         if efficiency_function is not None:
-            detection_efficiency = efficiency_function(energy)
+            detection_efficiency = efficiency_function(energy, **efficiency_function_kwargs)
         else:
             # otherwise, just use the polynomial coefficients to get the detection efficiency
             detection_efficiency = np.polyval(efficiency_coeffs, energy)
