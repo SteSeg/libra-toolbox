@@ -662,6 +662,7 @@ class SampleMeasurement(Measurement):
         channel_nb: int,
         search_width: float = 800,
         summing_method: str = 'sum_gaussian',
+        efficiency_function = None,
     ):
         # find right background detector
 
@@ -687,7 +688,12 @@ class SampleMeasurement(Measurement):
         nb_counts_measured = np.array(nb_counts_measured)
         nb_counts_measured_err = np.sqrt(nb_counts_measured)
 
-        detection_efficiency = np.polyval(efficiency_coeffs, energy)
+        # check if there is an efficiency function provided, if so use it to get the detection efficiency
+        if efficiency_function is not None:
+            detection_efficiency = efficiency_function(energy)
+        else:
+            # otherwise, just use the polynomial coefficients to get the detection efficiency
+            detection_efficiency = np.polyval(efficiency_coeffs, energy)
 
         gamma_emmitted = nb_counts_measured / detection_efficiency
         gamma_emmitted_err = nb_counts_measured_err / detection_efficiency

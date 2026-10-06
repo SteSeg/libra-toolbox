@@ -835,6 +835,65 @@ def test_get_multipeak_area_two_close_peaks():
 
 
 @pytest.mark.parametrize(
+    "efficiency_coeffs, efficiency_function, expected_efficiency",
+    [
+        (np.array([0.0, 0.25]), None, 0.25),
+        (np.array([0.0, 0.5]), lambda energies: 0.125 * np.asarray(energies), 0.125),
+    ],
+)
+def test_get_gamma_emitted_uses_custom_or_polynomial_efficiency(
+    monkeypatch, efficiency_coeffs, efficiency_function, expected_efficiency
+):
+    # BUILD
+    nuclide_reactant = Nuclide(name="TestNuclide", atomic_mass=200)
+    activated_nuclide = Nuclide(
+        name="ActivatedNuclide",
+        energy=[1.0],
+        intensity=[1.0],
+        half_life=10 * 24 * 3600,
+    )
+
+    reaction = Reaction(
+        reactant=nuclide_reactant,
+        product=activated_nuclide,
+        cross_section=20.0,
+    )
+
+    foil = ActivationFoil(reaction=reaction, mass=0.1, name="TestFoil")
+    measurement = compass.SampleMeasurement("sample")
+    measurement.foil = foil
+    measurement.start_time = datetime.datetime(2024, 11, 7)
+    measurement.stop_time = datetime.datetime(2024, 11, 7, 1)
+    measurement.detectors = [compass.Detector(channel_nb=3)]
+    measurement.get_detector(3).real_count_time = 3600
+    measurement.get_detector(3).live_count_time = 3600
+    measurement.get_detector(3).events = np.array([(0, 1.0), (1, 2.0), (2, 3.0)])
+
+    background_measurement = compass.Measurement("background")
+    background_measurement.detectors = [compass.Detector(channel_nb=3)]
+    background_measurement.get_detector(3).real_count_time = 3600
+    background_measurement.get_detector(3).live_count_time = 3600
+    background_measurement.get_detector(3).events = np.array([(0, 0.0), (1, 0.0)])
+
+    monkeypatch.setattr(compass, "get_multipeak_area", lambda *args, **kwargs: np.array([100.0]))
+
+    # RUN
+    gammas_emitted = measurement.get_gamma_emitted(
+        background_measurement=background_measurement,
+        efficiency_coeffs=efficiency_coeffs,
+        calibration_coeffs=np.array([1.0, 0.0]),
+        channel_nb=3,
+        search_width=300,
+        summing_method="sum_gaussian",
+        efficiency_function=efficiency_function,
+    )
+
+    # TEST
+    expected = 100.0 / expected_efficiency
+    assert np.isclose(gammas_emitted[0], expected)
+
+
+@pytest.mark.parametrize(
     "efficiency, summing_method",
     [
         (1e-2, "sum_gaussian"),
