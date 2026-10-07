@@ -834,15 +834,19 @@ def test_get_multipeak_area_two_close_peaks():
         assert np.isclose(areas[i], expected_area, rtol=1e-2)
 
 
+def eff_curve_func(E, *a):
+    return a[0] + np.exp(a[1] * E)
+
+
 @pytest.mark.parametrize(
-    "efficiency_coeffs, efficiency_function, efficiency_function_kwargs, expected_efficiency",
+    "efficiency_coeffs, efficiency_function, efficiency_function_args, expected_efficiency",
     [
         (np.array([0.0, 0.25]), None, None, 0.25),
-        (np.array([0.0, 0.5]), lambda energies: 0.125 * np.asarray(energies), None, 0.125),
+        (np.array([0.0, 0.5]), eff_curve_func, [-0.80, 0.0], 0.20),
     ],
 )
 def test_get_gamma_emitted_uses_custom_or_polynomial_efficiency(
-    monkeypatch, efficiency_coeffs, efficiency_function, efficiency_function_kwargs, expected_efficiency
+    monkeypatch, efficiency_coeffs, efficiency_function, efficiency_function_args, expected_efficiency
 ):
     # BUILD
     nuclide_reactant = Nuclide(name="TestNuclide", atomic_mass=200)
@@ -886,7 +890,7 @@ def test_get_gamma_emitted_uses_custom_or_polynomial_efficiency(
         search_width=300,
         summing_method="sum_gaussian",
         efficiency_function=efficiency_function,
-        efficiency_function_kwargs=efficiency_function_kwargs,
+        efficiency_function_args=efficiency_function_args,
     )
 
     # TEST
