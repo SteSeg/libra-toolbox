@@ -835,7 +835,11 @@ def test_get_multipeak_area_two_close_peaks():
 
 
 def eff_curve_func(E, *a):
-    return a[0] + np.exp(a[1] * E)
+    eff = 0
+    E = np.array(E)
+    for i,a_i in enumerate(a):
+        eff += a_i * E**i
+    return eff
 
 
 @pytest.mark.parametrize(
