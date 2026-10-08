@@ -231,11 +231,14 @@ class Vessel1L(Component):
     socket_depth: float = 10.65
     socket_base_thickness: float = 0.15
 
-    # Vessel material
+    # Main vessel material
     material: openmc.Material = None
 
-    # Cap thickness for all three pipes (cm)
+    # Cap thickness for the three large pipes (cm)
     pipe_cap_thickness: float = 0.3
+
+    # All three bolt sleeves are raised by this offset (cm)
+    bolt_height_offset: float = 0.6
 
     # ------------------------------------------------------------------
     # Derived elevations
@@ -263,11 +266,11 @@ class Vessel1L(Component):
 
     @property
     def pipe_penetration_bottom(self):
-        # Pipes extend 0.8 cm below the underside of the lid.
+        # Large pipes extend 0.8 cm below the original lid.
         return self.fill_top - 0.8
 
     # ------------------------------------------------------------------
-    # Pipe and bolt configuration
+    # Three existing large pipes and bolt sleeves
     # ------------------------------------------------------------------
 
     @property
@@ -302,6 +305,49 @@ class Vessel1L(Component):
         ]
 
     # ------------------------------------------------------------------
+    # Five additional small pipes
+    # ------------------------------------------------------------------
+
+    @property
+    def small_pipe_data(self):
+        """
+        Each entry: name, x, y, is_internal.
+
+        One internal pipe at (0, -5.7).
+        Four external pipes tangent to the outer vessel radius,
+        positioned at 30, 60, 120 and 150 degrees on the -y side.
+        """
+        pipes = [
+            ("SmallPipeInternal", 0.0, -5.7, True),
+        ]
+
+        center_radius = self.external_radius + 0.32
+
+        for angle_deg in (30, 60, 120, 150):
+            angle = np.deg2rad(angle_deg)
+            x = center_radius * np.cos(angle)
+            y = -center_radius * np.sin(angle)
+
+            pipes.append(
+                (
+                    f"SmallPipeExternal{angle_deg}",
+                    x,
+                    y,
+                    False,
+                )
+            )
+
+        return pipes
+
+    @property
+    def small_pipe_bottom(self):
+        return self.lid_top - 8.4
+
+    @property
+    def small_pipe_cap_thickness(self):
+        return 0.15
+
+    # ------------------------------------------------------------------
     # Internal fill region
     # ------------------------------------------------------------------
 
@@ -310,8 +356,8 @@ class Vessel1L(Component):
         """
         Region available to breeder/headspace inside the vessel.
 
-        Excludes the socket footprint and all pipe footprints below
-        the lid. Pipe bores are deliberately left void.
+        Excludes the socket, the three large pipes, and the internal
+        small pipe. External small pipes do not remove internal volume.
         """
         vessel_inner = openmc.ZCylinder(r=self.radius)
         bottom = openmc.ZPlane(z0=self.fill_bottom)
@@ -319,7 +365,7 @@ class Vessel1L(Component):
 
         region = -vessel_inner & +bottom & -top
 
-        # Exclude the socket base, socket wall, and socket bore.
+        # Central socket footprint, including its base and wall.
         socket_outer = openmc.ZCylinder(
             r=self.socket_external_radius
         )
@@ -327,15 +373,14 @@ class Vessel1L(Component):
             z0=self.socket_base_bottom
         )
 
-        socket_exclusion = (
+        region &= ~(
             -socket_outer
             & +socket_bottom
             & -top
         )
-        region &= ~socket_exclusion
 
-        # Exclude each pipe footprint inside the vessel.
-        pipe_bottom = openmc.ZPlane(
+        # Three large pipe footprints below the original lid.
+        large_pipe_bottom = openmc.ZPlane(
             z0=self.pipe_penetration_bottom
         )
 
@@ -347,31 +392,41 @@ class Vessel1L(Component):
                 x0=x, y0=y, r=outer_r
             )
 
-            pipe_exclusion = (
+            region &= ~(
                 -pipe_outer
-                & +pipe_bottom
+                & +large_pipe_bottom
                 & -top
             )
-            region &= ~pipe_exclusion
+
+        # Internal small pipe footprint.
+        small_outer = openmc.ZCylinder(
+            x0=0.0, y0=-5.7, r=0.32
+        )
+        small_bottom = openmc.ZPlane(
+            z0=self.small_pipe_bottom
+        )
+
+        region &= ~(
+            -small_outer
+            & +small_bottom
+            & -top
+        )
 
         return region
 
     # ------------------------------------------------------------------
-    # Fill volume calculations
+    # Available fill area and volume
     # ------------------------------------------------------------------
 
     def available_area(self, z):
-        """Cross-sectional area available to fill at elevation z."""
         if z < self.fill_bottom or z > self.fill_top:
             return 0.0
 
         area = np.pi * self.radius**2
 
-        # Exclude the socket's complete outer footprint.
         if self.socket_base_bottom <= z <= self.fill_top:
             area -= np.pi * self.socket_external_radius**2
 
-        # Exclude complete pipe footprints where they penetrate the vessel.
         if self.pipe_penetration_bottom <= z <= self.fill_top:
             for (
                 name, x, y, inner_r, outer_r, pipe_height,
@@ -379,10 +434,13 @@ class Vessel1L(Component):
             ) in self.pipe_data:
                 area -= np.pi * outer_r**2
 
+        if self.small_pipe_bottom <= z <= self.fill_top:
+            area -= np.pi * 0.32**2
+
         return max(area, 0.0)
 
     def volume_below(self, z):
-        """Available volume from fill_bottom up to elevation z."""
+        """Available fill volume between fill_bottom and elevation z."""
         z = min(max(z, self.fill_bottom), self.fill_top)
 
         breakpoints = [
@@ -390,6 +448,7 @@ class Vessel1L(Component):
             for point in (
                 self.socket_base_bottom,
                 self.pipe_penetration_bottom,
+                self.small_pipe_bottom,
             )
             if self.fill_bottom < point < z
         ]
@@ -400,12 +459,11 @@ class Vessel1L(Component):
             z,
             points=breakpoints or None,
         )
+
         return volume
 
     def height_for_volume(self, volume):
-        """
-        Return fill height above fill_bottom for a requested volume (cm³).
-        """
+        """Return fill height above fill_bottom for a volume in cm³."""
         if volume < 0:
             raise ValueError("Fill volume cannot be negative.")
 
@@ -437,6 +495,9 @@ class Vessel1L(Component):
             raise ValueError("Vessel1L requires a vessel material.")
 
         cells = []
+
+        # TODO: Set this to the correct material once identified.
+        additional_lid_material = None
 
         # Common surfaces
         inner_cyl = openmc.ZCylinder(r=self.radius)
@@ -485,8 +546,12 @@ class Vessel1L(Component):
         )
 
         # --------------------------------------------------------------
-        # 3. Lid with openings for the socket and pipes
+        # 3. Original vessel lid
         # --------------------------------------------------------------
+
+        socket_outer = openmc.ZCylinder(
+            r=self.socket_external_radius
+        )
 
         lid_region = (
             -outer_cyl
@@ -494,11 +559,10 @@ class Vessel1L(Component):
             & -lid_top
         )
 
-        socket_outer = openmc.ZCylinder(
-            r=self.socket_external_radius
-        )
+        # Socket opening
         lid_region &= ~(-socket_outer)
 
+        # Openings for the three large pipes
         for (
             name, x, y, inner_r, outer_r, pipe_height,
             bolt_offset, bolt_height, bolt_outer_r
@@ -507,6 +571,12 @@ class Vessel1L(Component):
                 x0=x, y0=y, r=outer_r
             )
             lid_region &= ~(-pipe_outer)
+
+        # Opening for the internal small pipe
+        small_internal_outer = openmc.ZCylinder(
+            x0=0.0, y0=-5.7, r=0.32
+        )
+        lid_region &= ~(-small_internal_outer)
 
         cells.append(
             openmc.Cell(
@@ -542,7 +612,7 @@ class Vessel1L(Component):
         )
 
         # --------------------------------------------------------------
-        # 5. Central socket cylindrical wall
+        # 5. Central socket wall
         # --------------------------------------------------------------
 
         socket_inner = openmc.ZCylinder(
@@ -565,10 +635,10 @@ class Vessel1L(Component):
         )
 
         # --------------------------------------------------------------
-        # 6. Pipes, hollow bolts, and solid caps
+        # 6. Three large pipes, bolt sleeves, and solid caps
         # --------------------------------------------------------------
 
-        pipe_bottom = openmc.ZPlane(
+        large_pipe_bottom = openmc.ZPlane(
             z0=self.pipe_penetration_bottom
         )
 
@@ -585,42 +655,43 @@ class Vessel1L(Component):
             )
 
             pipe_top_z = self.lid_top + pipe_height
-            pipe_wall_top_z = (
-                pipe_top_z - self.pipe_cap_thickness
-            )
+            pipe_wall_top_z = pipe_top_z - self.pipe_cap_thickness
 
             pipe_wall_top = openmc.ZPlane(
                 z0=pipe_wall_top_z
             )
 
-            # The bolt bore matches the pipe bore. This is the key fix:
-            # 0.50 cm for the twin pipes and 0.85 cm for the third pipe.
-            bolt_inner = openmc.ZCylinder(
-                x0=x, y0=y, r=inner_r
+            # Raise each bolt sleeve by 0.6 cm.
+            bolt_bottom_z = (
+                self.lid_top
+                + bolt_offset
+                + self.bolt_height_offset
             )
-            bolt_outer = openmc.ZCylinder(
-                x0=x, y0=y, r=bolt_outer_r
-            )
-
-            bolt_bottom_z = self.lid_top + bolt_offset
             bolt_top_z = bolt_bottom_z + bolt_height
 
             bolt_bottom = openmc.ZPlane(z0=bolt_bottom_z)
             bolt_top = openmc.ZPlane(z0=bolt_top_z)
 
+            # Hollow bolt sleeve, matching the pipe's inner radius.
+            bolt_inner = openmc.ZCylinder(
+                x0=x, y0=y, r=inner_r
+            )
+            bolt_outer_surface = openmc.ZCylinder(
+                x0=x, y0=y, r=bolt_outer_r
+            )
+
             bolt_region = (
                 +bolt_inner
-                & -bolt_outer
+                & -bolt_outer_surface
                 & +bolt_bottom
                 & -bolt_top
             )
 
-            # Pipe wall is annular; remove the bolt's occupied region
-            # wherever the bolt sleeve overlaps the pipe wall.
+            # Pipe wall, excluding the bolt sleeve where they overlap.
             pipe_wall_region = (
                 +pipe_inner
                 & -pipe_outer
-                & +pipe_bottom
+                & +large_pipe_bottom
                 & -pipe_wall_top
             )
             pipe_wall_region &= ~bolt_region
@@ -641,9 +712,9 @@ class Vessel1L(Component):
                 )
             )
 
-            # Pipe bore intentionally remains void: no cell is added.
+            # The pipe bores remain void.
 
-            # Solid circular cap, 0.3 cm thick.
+            # Solid 0.3 cm cap at the top of each pipe.
             cap_bottom = openmc.ZPlane(
                 z0=pipe_wall_top_z
             )
@@ -664,6 +735,99 @@ class Vessel1L(Component):
                     region=cap_region,
                 )
             )
+
+        # --------------------------------------------------------------
+        # 7. Five small pipes and bottom caps
+        # --------------------------------------------------------------
+
+        small_bottom_z = self.small_pipe_bottom
+        small_cap_top_z = (
+            small_bottom_z + self.small_pipe_cap_thickness
+        )
+
+        small_bottom = openmc.ZPlane(z0=small_bottom_z)
+        small_cap_top = openmc.ZPlane(z0=small_cap_top_z)
+
+        for name, x, y, is_internal in self.small_pipe_data:
+            small_inner = openmc.ZCylinder(
+                x0=x, y0=y, r=0.18
+            )
+            small_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=0.32
+            )
+
+            small_wall_region = (
+                +small_inner
+                & -small_outer
+                & +small_cap_top
+                & -lid_top
+            )
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{name}",
+                    fill=self.material,
+                    region=small_wall_region,
+                )
+            )
+
+            small_cap_region = (
+                -small_outer
+                & +small_bottom
+                & -small_cap_top
+            )
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{name}_Cap",
+                    fill=self.material,
+                    region=small_cap_region,
+                )
+            )
+
+            # No cell is created inside the small-pipe bore.
+
+        # --------------------------------------------------------------
+        # 8. Additional 0.6 cm lid
+        # --------------------------------------------------------------
+
+        additional_lid_top_z = self.lid_top + 0.6
+        additional_lid_top = openmc.ZPlane(
+            z0=additional_lid_top_z
+        )
+
+        additional_lid_region = (
+            -outer_cyl
+            & +lid_top
+            & -additional_lid_top
+        )
+
+        # Central socket opening
+        additional_lid_region &= ~(-socket_outer)
+
+        # The holes are sized to the pipes, not the raised bolt sleeves.
+        for (
+            name, x, y, inner_r, outer_r, pipe_height,
+            bolt_offset, bolt_height, bolt_outer_r
+        ) in self.pipe_data:
+            pipe_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=outer_r
+            )
+            additional_lid_region &= ~(-pipe_outer)
+
+        # The internal small pipe does not extend above the original lid;
+        # the additional lid therefore covers its top opening.
+        #
+        # The four external small pipes are tangent to the outer
+        # circumference and do not require holes through this disk.
+
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_AdditionalLid",
+                fill=self.material,
+                region=additional_lid_region,
+            )
+        )
 
         return cells
     
