@@ -11,6 +11,7 @@ class Component:
     """Base experiment component.
 
     Position and rotation are expressed in the experiment coordinate system.
+    Measures are always in (cm).
     """
 
     name: str
@@ -216,12 +217,17 @@ class Table(Component):
 
 @dataclass
 class Vessel1L(Component):
-    radius: float = 12.853
-    external_radius: float = 13.272
+    radius: float = 7.0  # cm
+    external_radius: float = 7.3  # cm
 
-    base_thickness: float = 0.786
-    height: float = 21.093
-    cover_thickness: float = 2.392
+    base_thickness: float = 0.2  # cm
+    height: float = 11.14  # cm
+    cover_thickness: float = 0.5  # cm - 0.01 cm uncertainty
+
+    socket_radius: float = 0.95  # cm
+    socket_external_radius: float = 1.1  # cm - 0.01 cm uncertainty
+    socket_depth: float = 10.65  # cm
+    socket_base_thickness: float = 0.15  # cm - 0.04 cm uncertainty
 
     material: openmc.Material = None
 
@@ -231,33 +237,85 @@ class Vessel1L(Component):
 
     @property
     def fill_top(self):
-        return self.base_thickness + self.height
+        return self.fill_bottom + self.height
+
+    @property
+    def lid_top(self):
+        return self.fill_top + self.cover_thickness
+
+    @property
+    def socket_base_top(self):
+        """Top surface of the socket base."""
+        return self.lid_top - self.socket_depth
+
+    @property
+    def socket_base_bottom(self):
+        """Bottom surface of the socket base."""
+        return self.socket_base_top - self.socket_base_thickness
 
     @property
     def fill_region(self):
+        """
+        Internal vessel volume available to the breeder/headspace.
+
+        The socket cavity and the solid socket base are excluded.
+        """
         inner = openmc.ZCylinder(r=self.radius)
 
         bottom = openmc.ZPlane(z0=self.fill_bottom)
         top = openmc.ZPlane(z0=self.fill_top)
 
-        return +bottom & -top & -inner
+        # Entire internal vessel volume
+        region = +bottom & -top & -inner
+
+        # Socket cavity + socket base occupy the central region
+        socket = openmc.ZCylinder(r=self.socket_external_radius)
+        socket_base_bottom = openmc.ZPlane(
+            z0=self.socket_base_bottom
+        )
+
+        socket_exclusion = (
+            +socket_base_bottom
+            & -top
+            & -socket
+        )
+
+        return region & ~socket_exclusion
 
     def geometry(self):
-        outer = openmc.ZCylinder(r=self.external_radius)
+        """
+        Construct the physical Inconel vessel.
+
+        Includes:
+        - vessel bottom
+        - cylindrical vessel wall
+        - lid
+        - socket wall
+        - socket base
+        """
+
         inner = openmc.ZCylinder(r=self.radius)
+        outer = openmc.ZCylinder(r=self.external_radius)
+        socket_inner_cylinder = openmc.ZCylinder(r=self.socket_radius)
 
         bottom = openmc.ZPlane(z0=0.0)
         wall_bottom = openmc.ZPlane(z0=self.fill_bottom)
         wall_top = openmc.ZPlane(z0=self.fill_top)
-        top = openmc.ZPlane(
-            z0=self.fill_top + self.cover_thickness
-        )
+        lid_top = openmc.ZPlane(z0=self.lid_top)
+
+        # ---------------------------------------------------------
+        # Vessel bottom
+        # ---------------------------------------------------------
 
         bottom_region = (
             +bottom
             & -wall_bottom
             & -outer
         )
+
+        # ---------------------------------------------------------
+        # Cylindrical vessel wall
+        # ---------------------------------------------------------
 
         wall_region = (
             +wall_bottom
@@ -266,26 +324,100 @@ class Vessel1L(Component):
             & -outer
         )
 
-        top_region = (
+        # ---------------------------------------------------------
+        # Vessel lid
+        # ---------------------------------------------------------
+
+        lid_region = (
             +wall_top
-            & -top
+            & -lid_top
+            & +socket_inner_cylinder
             & -outer
+        )
+
+        # ---------------------------------------------------------
+        # Socket wall
+        #
+        # Socket depth is measured from the TOP of the lid.
+        # Therefore the socket extends from the socket-base-top
+        # all the way to the lid top.
+        # ---------------------------------------------------------
+
+        socket_inner = openmc.ZCylinder(
+            r=self.socket_radius
+        )
+
+        socket_outer = openmc.ZCylinder(
+            r=self.socket_external_radius
+        )
+
+        socket_base_top = openmc.ZPlane(
+            z0=self.socket_base_top
+        )
+
+        socket_wall_region = (
+            +socket_base_top
+            & -lid_top
+            & +socket_inner
+            & -socket_outer
+        )
+
+        # ---------------------------------------------------------
+        # Socket base
+        # ---------------------------------------------------------
+
+        socket_base_bottom = openmc.ZPlane(
+            z0=self.socket_base_bottom
+        )
+
+        socket_base_region = (
+            +socket_base_bottom
+            & -socket_base_top
+            & -socket_outer
+        )
+
+        # ---------------------------------------------------------
+        # Complete vessel
+        # ---------------------------------------------------------
+
+        region = (
+            bottom_region
+            | wall_region
+            | lid_region
+            | socket_wall_region
+            | socket_base_region
         )
 
         cell = openmc.Cell(
             name=self.name,
-            region=(
-                bottom_region
-                | wall_region
-                | top_region
-            ),
+            region=region,
             fill=self.material,
         )
 
         return [cell]
 
+    def available_area(self, z):
+        """
+        Cross-sectional area available to the breeder/headspace
+        at axial position z.
+        """
+
+        if not self.fill_bottom <= z <= self.fill_top:
+            return 0.0
+
+        area = np.pi * self.radius**2
+
+        # The socket base and socket cavity both exclude the
+        # central socket-radius area.
+        if self.socket_base_bottom <= z <= self.fill_top:
+            area -= np.pi * self.socket_radius**2
+
+        return area
+
     def volume_below(self, z):
-        """Available vessel volume below z [cm3]."""
+        """
+        Available internal vessel volume between fill_bottom and z.
+        """
 
         z = np.clip(
             z,
@@ -293,13 +425,21 @@ class Vessel1L(Component):
             self.fill_top,
         )
 
-        height = z - self.fill_bottom
+        from scipy.integrate import quad
 
-        # Simple vessel for now.
-        return np.pi * self.radius**2 * height
+        return quad(
+            self.available_area,
+            self.fill_bottom,
+            z,
+        )[0]
 
     def height_for_volume(self, volume):
-        """Return the fill height corresponding to a volume [cm3]."""
+        """
+        Return the breeder fill height corresponding to the
+        requested available volume.
+        """
+
+        from scipy.optimize import brentq
 
         if volume <= 0:
             raise ValueError("Volume must be positive.")
@@ -308,8 +448,8 @@ class Vessel1L(Component):
 
         if volume > total_volume:
             raise ValueError(
-                f"Requested volume ({volume:.3f} cm3) exceeds "
-                f"the available vessel volume ({total_volume:.3f} cm3)."
+                f"Requested volume ({volume:.3f} cm³) exceeds "
+                f"available vessel volume ({total_volume:.3f} cm³)."
             )
 
         z = brentq(
@@ -349,19 +489,10 @@ class Breeder(Component):
             self.requested_volume
         )
 
-        bottom = openmc.ZPlane(
-            z0=vessel.fill_bottom
-        )
+        bottom = openmc.ZPlane(z0=vessel.fill_bottom)
+        top = openmc.ZPlane(z0=vessel.fill_bottom + fill_height)
 
-        top = openmc.ZPlane(
-            z0=vessel.fill_bottom + fill_height
-        )
-
-        return (
-            vessel.fill_region
-            & +bottom
-            & -top
-        )
+        return vessel.fill_region & +bottom & -top
 
 @dataclass
 class HeadSpace:
@@ -481,9 +612,6 @@ class OuterVesselSweepGas(Component):
         )
 
         return [cell]
-
-from dataclasses import dataclass
-import openmc
 
 
 @dataclass
