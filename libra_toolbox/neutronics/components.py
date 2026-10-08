@@ -496,9 +496,6 @@ class Vessel1L(Component):
 
         cells = []
 
-        # TODO: Set this to the correct material once identified.
-        additional_lid_material = None
-
         # Common surfaces
         inner_cyl = openmc.ZCylinder(r=self.radius)
         outer_cyl = openmc.ZCylinder(r=self.external_radius)
@@ -791,10 +788,10 @@ class Vessel1L(Component):
         # 8. Additional 0.6 cm lid
         # --------------------------------------------------------------
 
+        # Additional 0.6 cm lid, with the same openings as the original lid
         additional_lid_top_z = self.lid_top + 0.6
-        additional_lid_top = openmc.ZPlane(
-            z0=additional_lid_top_z
-        )
+        additional_lid_top = openmc.ZPlane(z0=additional_lid_top_z)
+        additional_lid_material = self.material  # TODO: Use a different material for the additional lid?
 
         additional_lid_region = (
             -outer_cyl
@@ -802,29 +799,21 @@ class Vessel1L(Component):
             & -additional_lid_top
         )
 
-        # Central socket opening
+        # Opening for the central socket
         additional_lid_region &= ~(-socket_outer)
 
-        # The holes are sized to the pipes, not the raised bolt sleeves.
+        # Openings for the three large pipes
         for (
             name, x, y, inner_r, outer_r, pipe_height,
             bolt_offset, bolt_height, bolt_outer_r
         ) in self.pipe_data:
-            pipe_outer = openmc.ZCylinder(
-                x0=x, y0=y, r=outer_r
-            )
+            pipe_outer = openmc.ZCylinder(x0=x, y0=y, r=outer_r)
             additional_lid_region &= ~(-pipe_outer)
-
-        # The internal small pipe does not extend above the original lid;
-        # the additional lid therefore covers its top opening.
-        #
-        # The four external small pipes are tangent to the outer
-        # circumference and do not require holes through this disk.
 
         cells.append(
             openmc.Cell(
                 name=f"{self.name}_AdditionalLid",
-                fill=self.material,
+                fill=additional_lid_material,
                 region=additional_lid_region,
             )
         )
