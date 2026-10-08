@@ -4,6 +4,7 @@ import openmc
 import materials
 import numpy as np
 from scipy.optimize import brentq
+from scipy.integrate import quad
 
 
 @dataclass(kw_only=True)
@@ -217,248 +218,468 @@ class Table(Component):
 
 @dataclass
 class Vessel1L(Component):
-    radius: float = 7.0  # cm
-    external_radius: float = 7.3  # cm
+    # Main vessel dimensions (cm)
+    radius: float = 7.0
+    external_radius: float = 7.3
+    base_thickness: float = 0.2
+    height: float = 11.14
+    cover_thickness: float = 0.5
 
-    base_thickness: float = 0.2  # cm
-    height: float = 11.14  # cm
-    cover_thickness: float = 0.5  # cm - 0.01 cm uncertainty
-
-    socket_radius: float = 0.95  # cm
-    socket_external_radius: float = 1.1  # cm - 0.01 cm uncertainty
-    socket_depth: float = 10.65  # cm
-    socket_base_thickness: float = 0.15  # cm - 0.04 cm uncertainty
+    # Central socket dimensions (cm)
+    socket_radius: float = 0.95
+    socket_external_radius: float = 1.1
+    socket_depth: float = 10.65
+    socket_base_thickness: float = 0.15
 
     material: openmc.Material = None
 
+    # ------------------------------------------------------------------
+    # Derived elevations
+    # ------------------------------------------------------------------
+
     @property
     def fill_bottom(self):
+        """Internal bottom elevation."""
         return self.base_thickness
 
     @property
     def fill_top(self):
+        """Internal top elevation, at the underside of the lid."""
         return self.fill_bottom + self.height
 
     @property
     def lid_top(self):
+        """Top elevation of the vessel lid."""
         return self.fill_top + self.cover_thickness
 
     @property
     def socket_base_top(self):
-        """Top surface of the socket base."""
+        """Top of the solid socket base."""
         return self.lid_top - self.socket_depth
 
     @property
     def socket_base_bottom(self):
-        """Bottom surface of the socket base."""
+        """Bottom of the solid socket base."""
         return self.socket_base_top - self.socket_base_thickness
+
+    @property
+    def pipe_penetration_bottom(self):
+        """Bottom of the pipe walls inside the vessel."""
+        return self.fill_top - 0.8
+
+    # ------------------------------------------------------------------
+    # Fixed pipe and bolt configuration
+    # ------------------------------------------------------------------
+
+    @property
+    def pipe_data(self):
+        """
+        Each entry contains:
+        name, x, y, inner radius, outer radius, height above lid,
+        bolt bottom above lid, bolt height, bolt outer radius.
+        """
+        return [
+            (
+                "TwinPipe1",
+                -5.7, 0.0,
+                0.50, 0.65,
+                32.0,
+                2.0, 3.5, 1.5,
+            ),
+            (
+                "TwinPipe2",
+                5.7, 0.0,
+                0.50, 0.65,
+                32.0,
+                2.0, 3.5, 1.5,
+            ),
+            (
+                "ThirdPipe",
+                0.0, 5.85,
+                0.85, 0.95,
+                4.85,
+                0.5, 3.3, 1.9,
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Internal fill region
+    # ------------------------------------------------------------------
 
     @property
     def fill_region(self):
         """
-        Internal vessel volume available to the breeder/headspace.
+        Region available to breeder and headspace.
 
-        The socket cavity and the solid socket base are excluded.
+        The fill excludes:
+        - The central socket, including its wall and base.
+        - The material occupied by pipe walls below the lid.
+
+        The pipe interiors remain open to the vessel interior.
         """
-        inner = openmc.ZCylinder(r=self.radius)
+        vessel_inner = openmc.ZCylinder(r=self.radius)
 
         bottom = openmc.ZPlane(z0=self.fill_bottom)
         top = openmc.ZPlane(z0=self.fill_top)
 
-        # Entire internal vessel volume
-        region = +bottom & -top & -inner
+        region = -vessel_inner & +bottom & -top
 
-        # Socket cavity + socket base occupy the central region
-        socket = openmc.ZCylinder(r=self.socket_external_radius)
-        socket_base_bottom = openmc.ZPlane(
+        # Exclude the entire socket footprint. This avoids overlap with
+        # both the socket wall and the solid socket base.
+        socket_outer = openmc.ZCylinder(
+            r=self.socket_external_radius
+        )
+        socket_bottom = openmc.ZPlane(
             z0=self.socket_base_bottom
         )
 
         socket_exclusion = (
-            +socket_base_bottom
+            -socket_outer
+            & +socket_bottom
             & -top
-            & -socket
+        )
+        region &= ~socket_exclusion
+
+        # Exclude the pipe walls inside the vessel. Exclude only their
+        # annuli, not their hollow interiors.
+        pipe_bottom = openmc.ZPlane(
+            z0=self.pipe_penetration_bottom
         )
 
-        return region & ~socket_exclusion
+        for (
+            name, x, y, inner_r, outer_r, pipe_height,
+            bolt_offset, bolt_height, bolt_outer_r
+        ) in self.pipe_data:
+            pipe_inner = openmc.ZCylinder(
+                x0=x, y0=y, r=inner_r
+            )
+            pipe_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=outer_r
+            )
+
+            pipe_wall = (
+                +pipe_inner
+                & -pipe_outer
+                & +pipe_bottom
+                & -top
+            )
+            region &= ~pipe_wall
+
+        return region
+
+    # ------------------------------------------------------------------
+    # Available cross-sectional area and fill volume
+    # ------------------------------------------------------------------
+
+    def available_area(self, z):
+        """
+        Cross-sectional area available to the fill at elevation z.
+
+        z is an absolute elevation in the vessel coordinate system.
+        """
+        if z < self.fill_bottom or z > self.fill_top:
+            return 0.0
+
+        area = np.pi * self.radius**2
+
+        # The socket occupies its entire external footprint.
+        if self.socket_base_bottom <= z <= self.fill_top:
+            area -= np.pi * self.socket_external_radius**2
+
+        # Subtract only pipe-wall annuli; their interiors remain open.
+        if self.pipe_penetration_bottom <= z <= self.fill_top:
+            for (
+                name, x, y, inner_r, outer_r, pipe_height,
+                bolt_offset, bolt_height, bolt_outer_r
+            ) in self.pipe_data:
+                area -= np.pi * (
+                    outer_r**2 - inner_r**2
+                )
+
+        return max(area, 0.0)
+
+    def volume_below(self, z):
+        """Available fill volume from fill_bottom to elevation z."""
+        z = min(max(z, self.fill_bottom), self.fill_top)
+
+        volume, _ = quad(
+            self.available_area,
+            self.fill_bottom,
+            z,
+            points=[
+                self.socket_base_bottom,
+                self.pipe_penetration_bottom,
+            ],
+        )
+        return volume
+
+    def height_for_volume(self, volume):
+        """
+        Return the fill height measured upward from fill_bottom,
+        for a requested volume in cm³.
+        """
+        if volume < 0:
+            raise ValueError("Fill volume cannot be negative.")
+
+        max_volume = self.volume_below(self.fill_top)
+
+        if volume > max_volume:
+            raise ValueError(
+                f"Requested volume ({volume:.6g} cm³) exceeds "
+                f"the available vessel volume ({max_volume:.6g} cm³)."
+            )
+
+        if volume == 0:
+            return 0.0
+
+        return brentq(
+            lambda h: self.volume_below(
+                self.fill_bottom + h
+            ) - volume,
+            0.0,
+            self.height,
+        )
+
+    # ------------------------------------------------------------------
+    # OpenMC geometry
+    # ------------------------------------------------------------------
 
     def geometry(self):
-        """
-        Construct the physical Inconel vessel.
+        if self.material is None:
+            raise ValueError(
+                "Vessel1L requires a material."
+            )
 
-        Includes:
-        - vessel bottom
-        - cylindrical vessel wall
-        - lid
-        - socket wall
-        - socket base
-        """
+        cells = []
 
-        inner = openmc.ZCylinder(r=self.radius)
-        outer = openmc.ZCylinder(r=self.external_radius)
-        socket_inner_cylinder = openmc.ZCylinder(r=self.socket_radius)
+        # Common surfaces
+        inner_cyl = openmc.ZCylinder(r=self.radius)
+        outer_cyl = openmc.ZCylinder(r=self.external_radius)
 
-        bottom = openmc.ZPlane(z0=0.0)
-        wall_bottom = openmc.ZPlane(z0=self.fill_bottom)
-        wall_top = openmc.ZPlane(z0=self.fill_top)
+        base_bottom = openmc.ZPlane(z0=0.0)
+        base_top = openmc.ZPlane(z0=self.fill_bottom)
+        fill_top = openmc.ZPlane(z0=self.fill_top)
         lid_top = openmc.ZPlane(z0=self.lid_top)
 
-        # ---------------------------------------------------------
-        # Vessel bottom
-        # ---------------------------------------------------------
-
+        # --------------------------------------------------------------
+        # 1. Vessel bottom
+        # --------------------------------------------------------------
         bottom_region = (
-            +bottom
-            & -wall_bottom
-            & -outer
+            -outer_cyl
+            & +base_bottom
+            & -base_top
         )
 
-        # ---------------------------------------------------------
-        # Cylindrical vessel wall
-        # ---------------------------------------------------------
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_Bottom",
+                fill=self.material,
+                region=bottom_region,
+            )
+        )
 
+        # --------------------------------------------------------------
+        # 2. Cylindrical vessel wall
+        # --------------------------------------------------------------
         wall_region = (
-            +wall_bottom
-            & -wall_top
-            & +inner
-            & -outer
+            +inner_cyl
+            & -outer_cyl
+            & +base_top
+            & -fill_top
         )
 
-        # ---------------------------------------------------------
-        # Vessel lid
-        # ---------------------------------------------------------
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_Wall",
+                fill=self.material,
+                region=wall_region,
+            )
+        )
 
+        # --------------------------------------------------------------
+        # 3. Lid, with holes for the socket and all three pipes
+        # --------------------------------------------------------------
         lid_region = (
-            +wall_top
+            -outer_cyl
+            & +fill_top
             & -lid_top
-            & +socket_inner_cylinder
-            & -outer
-        )
-
-        # ---------------------------------------------------------
-        # Socket wall
-        #
-        # Socket depth is measured from the TOP of the lid.
-        # Therefore the socket extends from the socket-base-top
-        # all the way to the lid top.
-        # ---------------------------------------------------------
-
-        socket_inner = openmc.ZCylinder(
-            r=self.socket_radius
         )
 
         socket_outer = openmc.ZCylinder(
             r=self.socket_external_radius
         )
+        lid_region &= ~(-socket_outer)
 
+        for (
+            name, x, y, inner_r, outer_r, pipe_height,
+            bolt_offset, bolt_height, bolt_outer_r
+        ) in self.pipe_data:
+            pipe_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=outer_r
+            )
+            lid_region &= ~(-pipe_outer)
+
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_Lid",
+                fill=self.material,
+                region=lid_region,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 4. Central socket base
+        # --------------------------------------------------------------
+        socket_inner = openmc.ZCylinder(
+            r=self.socket_radius
+        )
+        socket_outer = openmc.ZCylinder(
+            r=self.socket_external_radius
+        )
+        socket_base_bottom = openmc.ZPlane(
+            z0=self.socket_base_bottom
+        )
         socket_base_top = openmc.ZPlane(
             z0=self.socket_base_top
         )
 
-        socket_wall_region = (
-            +socket_base_top
-            & -lid_top
-            & +socket_inner
-            & -socket_outer
-        )
-
-        # ---------------------------------------------------------
-        # Socket base
-        # ---------------------------------------------------------
-
-        socket_base_bottom = openmc.ZPlane(
-            z0=self.socket_base_bottom
-        )
-
         socket_base_region = (
-            +socket_base_bottom
+            -socket_outer
+            & +socket_base_bottom
             & -socket_base_top
+        )
+
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_SocketBase",
+                fill=self.material,
+                region=socket_base_region,
+            )
+        )
+
+        # --------------------------------------------------------------
+        # 5. Central socket cylindrical wall
+        # --------------------------------------------------------------
+        socket_wall_region = (
+            +socket_inner
             & -socket_outer
+            & +socket_base_top
+            & -lid_top
         )
 
-        # ---------------------------------------------------------
-        # Complete vessel
-        # ---------------------------------------------------------
-
-        region = (
-            bottom_region
-            | wall_region
-            | lid_region
-            | socket_wall_region
-            | socket_base_region
+        cells.append(
+            openmc.Cell(
+                name=f"{self.name}_SocketWall",
+                fill=self.material,
+                region=socket_wall_region,
+            )
         )
 
-        cell = openmc.Cell(
-            name=self.name,
-            region=region,
-            fill=self.material,
+        # --------------------------------------------------------------
+        # 6. Pipes, bolts and the third pipe's end cap
+        # --------------------------------------------------------------
+        pipe_bottom = openmc.ZPlane(
+            z0=self.pipe_penetration_bottom
         )
 
-        return [cell]
+        for (
+            name, x, y, inner_r, outer_r, pipe_height,
+            bolt_offset, bolt_height, bolt_outer_r
+        ) in self.pipe_data:
 
-    def available_area(self, z):
-        """
-        Cross-sectional area available to the breeder/headspace
-        at axial position z.
-        """
-
-        if not self.fill_bottom <= z <= self.fill_top:
-            return 0.0
-
-        area = np.pi * self.radius**2
-
-        # The socket base and socket cavity both exclude the
-        # central socket-radius area.
-        if self.socket_base_bottom <= z <= self.fill_top:
-            area -= np.pi * self.socket_radius**2
-
-        return area
-
-    def volume_below(self, z):
-        """
-        Available internal vessel volume between fill_bottom and z.
-        """
-
-        z = np.clip(
-            z,
-            self.fill_bottom,
-            self.fill_top,
-        )
-
-        from scipy.integrate import quad
-
-        return quad(
-            self.available_area,
-            self.fill_bottom,
-            z,
-        )[0]
-
-    def height_for_volume(self, volume):
-        """
-        Return the breeder fill height corresponding to the
-        requested available volume.
-        """
-
-        from scipy.optimize import brentq
-
-        if volume <= 0:
-            raise ValueError("Volume must be positive.")
-
-        total_volume = self.volume_below(self.fill_top)
-
-        if volume > total_volume:
-            raise ValueError(
-                f"Requested volume ({volume:.3f} cm³) exceeds "
-                f"available vessel volume ({total_volume:.3f} cm³)."
+            pipe_inner = openmc.ZCylinder(
+                x0=x, y0=y, r=inner_r
+            )
+            pipe_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=outer_r
             )
 
-        z = brentq(
-            lambda z: self.volume_below(z) - volume,
-            self.fill_bottom,
-            self.fill_top,
-        )
+            pipe_top_z = self.lid_top + pipe_height
 
-        return z - self.fill_bottom
+            # The third pipe ends with a solid 0.3 cm cap.
+            if name == "ThirdPipe":
+                cap_thickness = 0.3
+                pipe_wall_top_z = pipe_top_z - cap_thickness
+            else:
+                pipe_wall_top_z = pipe_top_z
+
+            pipe_top = openmc.ZPlane(z0=pipe_wall_top_z)
+
+            pipe_wall_region = (
+                +pipe_inner
+                & -pipe_outer
+                & +pipe_bottom
+                & -pipe_top
+            )
+
+            # Hollow bolt sleeve. Where it surrounds the pipe, the
+            # sleeve replaces the pipe wall rather than overlapping it.
+            bolt_inner_r = 0.5
+            bolt_bottom_z = self.lid_top + bolt_offset
+            bolt_top_z = bolt_bottom_z + bolt_height
+
+            bolt_inner = openmc.ZCylinder(
+                x0=x, y0=y, r=bolt_inner_r
+            )
+            bolt_outer = openmc.ZCylinder(
+                x0=x, y0=y, r=bolt_outer_r
+            )
+            bolt_bottom_plane = openmc.ZPlane(
+                z0=bolt_bottom_z
+            )
+            bolt_top_plane = openmc.ZPlane(
+                z0=bolt_top_z
+            )
+
+            bolt_region = (
+                +bolt_inner
+                & -bolt_outer
+                & +bolt_bottom_plane
+                & -bolt_top_plane
+            )
+
+            pipe_wall_region &= ~bolt_region
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{name}",
+                    fill=self.material,
+                    region=pipe_wall_region,
+                )
+            )
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{name}_Bolt",
+                    fill=self.material,
+                    region=bolt_region,
+                )
+            )
+
+            # Solid circular cap at the end of the third pipe.
+            if name == "ThirdPipe":
+                cap_bottom = openmc.ZPlane(
+                    z0=pipe_wall_top_z
+                )
+                cap_top = openmc.ZPlane(
+                    z0=pipe_top_z
+                )
+
+                cap_region = (
+                    -pipe_outer
+                    & +cap_bottom
+                    & -cap_top
+                )
+
+                cells.append(
+                    openmc.Cell(
+                        name=f"{self.name}_{name}_Cap",
+                        fill=self.material,
+                        region=cap_region,
+                    )
+                )
+
+        return cells
     
 @dataclass
 class Breeder(Component):
