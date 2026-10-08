@@ -846,7 +846,7 @@ def eff_curve_func(E, *a):
     "efficiency_coeffs, efficiency_function, efficiency_function_args, expected_efficiency",
     [
         (np.array([0.0, 0.25]), None, None, 0.25),
-        (np.array([0.0, 0.5]), eff_curve_func, [-0.80, 0.0], 0.20),
+        (np.array([0.0, 0.5]), eff_curve_func, [-0.80, 1.0], 0.20),
     ],
 )
 def test_get_gamma_emitted_uses_custom_or_polynomial_efficiency(
@@ -897,6 +897,7 @@ def test_get_gamma_emitted_uses_custom_or_polynomial_efficiency(
         efficiency_function_args=efficiency_function_args,
     )
 
+    print(f"Computed gammas emitted: {gammas_emitted[0]}, Expected: {100.0 / expected_efficiency}")
     # TEST
     expected = 100.0 / expected_efficiency
     assert np.isclose(gammas_emitted[0], expected)
