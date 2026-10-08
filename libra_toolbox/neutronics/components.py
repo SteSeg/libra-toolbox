@@ -231,7 +231,11 @@ class Vessel1L(Component):
     socket_depth: float = 10.65
     socket_base_thickness: float = 0.15
 
+    # Vessel material
     material: openmc.Material = None
+
+    # Cap thickness for all three pipes (cm)
+    pipe_cap_thickness: float = 0.3
 
     # ------------------------------------------------------------------
     # Derived elevations
@@ -239,58 +243,53 @@ class Vessel1L(Component):
 
     @property
     def fill_bottom(self):
-        """Internal bottom elevation."""
         return self.base_thickness
 
     @property
     def fill_top(self):
-        """Internal top elevation, at the underside of the lid."""
         return self.fill_bottom + self.height
 
     @property
     def lid_top(self):
-        """Top elevation of the vessel lid."""
         return self.fill_top + self.cover_thickness
 
     @property
     def socket_base_top(self):
-        """Top of the solid socket base."""
         return self.lid_top - self.socket_depth
 
     @property
     def socket_base_bottom(self):
-        """Bottom of the solid socket base."""
         return self.socket_base_top - self.socket_base_thickness
 
     @property
     def pipe_penetration_bottom(self):
-        """Bottom of the pipe walls inside the vessel."""
+        # Pipes extend 0.8 cm below the underside of the lid.
         return self.fill_top - 0.8
 
     # ------------------------------------------------------------------
-    # Fixed pipe and bolt configuration
+    # Pipe and bolt configuration
     # ------------------------------------------------------------------
 
     @property
     def pipe_data(self):
         """
-        Each entry contains:
-        name, x, y, inner radius, outer radius, height above lid,
-        bolt bottom above lid, bolt height, bolt outer radius.
+        Each entry:
+        name, x, y, inner radius, outer radius, pipe height above lid,
+        bolt offset above lid, bolt height, bolt outer radius.
         """
         return [
             (
                 "TwinPipe1",
                 -5.7, 0.0,
                 0.50, 0.65,
-                32.0,
+                7.6,
                 2.0, 3.5, 1.5,
             ),
             (
                 "TwinPipe2",
                 5.7, 0.0,
                 0.50, 0.65,
-                32.0,
+                7.6,
                 2.0, 3.5, 1.5,
             ),
             (
@@ -309,23 +308,18 @@ class Vessel1L(Component):
     @property
     def fill_region(self):
         """
-        Region available to breeder and headspace.
+        Region available to breeder/headspace inside the vessel.
 
-        The fill excludes:
-        - The central socket, including its wall and base.
-        - The material occupied by pipe walls below the lid.
-
-        The pipe interiors remain open to the vessel interior.
+        Excludes the socket footprint and all pipe footprints below
+        the lid. Pipe bores are deliberately left void.
         """
         vessel_inner = openmc.ZCylinder(r=self.radius)
-
         bottom = openmc.ZPlane(z0=self.fill_bottom)
         top = openmc.ZPlane(z0=self.fill_top)
 
         region = -vessel_inner & +bottom & -top
 
-        # Exclude the entire socket footprint. This avoids overlap with
-        # both the socket wall and the solid socket base.
+        # Exclude the socket base, socket wall, and socket bore.
         socket_outer = openmc.ZCylinder(
             r=self.socket_external_radius
         )
@@ -340,8 +334,7 @@ class Vessel1L(Component):
         )
         region &= ~socket_exclusion
 
-        # Exclude the pipe walls inside the vessel. Exclude only their
-        # annuli, not their hollow interiors.
+        # Exclude each pipe footprint inside the vessel.
         pipe_bottom = openmc.ZPlane(
             z0=self.pipe_penetration_bottom
         )
@@ -350,73 +343,68 @@ class Vessel1L(Component):
             name, x, y, inner_r, outer_r, pipe_height,
             bolt_offset, bolt_height, bolt_outer_r
         ) in self.pipe_data:
-            pipe_inner = openmc.ZCylinder(
-                x0=x, y0=y, r=inner_r
-            )
             pipe_outer = openmc.ZCylinder(
                 x0=x, y0=y, r=outer_r
             )
 
-            pipe_wall = (
-                +pipe_inner
-                & -pipe_outer
+            pipe_exclusion = (
+                -pipe_outer
                 & +pipe_bottom
                 & -top
             )
-            region &= ~pipe_wall
+            region &= ~pipe_exclusion
 
         return region
 
     # ------------------------------------------------------------------
-    # Available cross-sectional area and fill volume
+    # Fill volume calculations
     # ------------------------------------------------------------------
 
     def available_area(self, z):
-        """
-        Cross-sectional area available to the fill at elevation z.
-
-        z is an absolute elevation in the vessel coordinate system.
-        """
+        """Cross-sectional area available to fill at elevation z."""
         if z < self.fill_bottom or z > self.fill_top:
             return 0.0
 
         area = np.pi * self.radius**2
 
-        # The socket occupies its entire external footprint.
+        # Exclude the socket's complete outer footprint.
         if self.socket_base_bottom <= z <= self.fill_top:
             area -= np.pi * self.socket_external_radius**2
 
-        # Subtract only pipe-wall annuli; their interiors remain open.
+        # Exclude complete pipe footprints where they penetrate the vessel.
         if self.pipe_penetration_bottom <= z <= self.fill_top:
             for (
                 name, x, y, inner_r, outer_r, pipe_height,
                 bolt_offset, bolt_height, bolt_outer_r
             ) in self.pipe_data:
-                area -= np.pi * (
-                    outer_r**2 - inner_r**2
-                )
+                area -= np.pi * outer_r**2
 
         return max(area, 0.0)
 
     def volume_below(self, z):
-        """Available fill volume from fill_bottom to elevation z."""
+        """Available volume from fill_bottom up to elevation z."""
         z = min(max(z, self.fill_bottom), self.fill_top)
+
+        breakpoints = [
+            point
+            for point in (
+                self.socket_base_bottom,
+                self.pipe_penetration_bottom,
+            )
+            if self.fill_bottom < point < z
+        ]
 
         volume, _ = quad(
             self.available_area,
             self.fill_bottom,
             z,
-            points=[
-                self.socket_base_bottom,
-                self.pipe_penetration_bottom,
-            ],
+            points=breakpoints or None,
         )
         return volume
 
     def height_for_volume(self, volume):
         """
-        Return the fill height measured upward from fill_bottom,
-        for a requested volume in cm³.
+        Return fill height above fill_bottom for a requested volume (cm³).
         """
         if volume < 0:
             raise ValueError("Fill volume cannot be negative.")
@@ -426,16 +414,16 @@ class Vessel1L(Component):
         if volume > max_volume:
             raise ValueError(
                 f"Requested volume ({volume:.6g} cm³) exceeds "
-                f"the available vessel volume ({max_volume:.6g} cm³)."
+                f"available volume ({max_volume:.6g} cm³)."
             )
 
         if volume == 0:
             return 0.0
 
         return brentq(
-            lambda h: self.volume_below(
-                self.fill_bottom + h
-            ) - volume,
+            lambda h: (
+                self.volume_below(self.fill_bottom + h) - volume
+            ),
             0.0,
             self.height,
         )
@@ -446,9 +434,7 @@ class Vessel1L(Component):
 
     def geometry(self):
         if self.material is None:
-            raise ValueError(
-                "Vessel1L requires a material."
-            )
+            raise ValueError("Vessel1L requires a vessel material.")
 
         cells = []
 
@@ -464,6 +450,7 @@ class Vessel1L(Component):
         # --------------------------------------------------------------
         # 1. Vessel bottom
         # --------------------------------------------------------------
+
         bottom_region = (
             -outer_cyl
             & +base_bottom
@@ -481,6 +468,7 @@ class Vessel1L(Component):
         # --------------------------------------------------------------
         # 2. Cylindrical vessel wall
         # --------------------------------------------------------------
+
         wall_region = (
             +inner_cyl
             & -outer_cyl
@@ -497,8 +485,9 @@ class Vessel1L(Component):
         )
 
         # --------------------------------------------------------------
-        # 3. Lid, with holes for the socket and all three pipes
+        # 3. Lid with openings for the socket and pipes
         # --------------------------------------------------------------
+
         lid_region = (
             -outer_cyl
             & +fill_top
@@ -530,12 +519,7 @@ class Vessel1L(Component):
         # --------------------------------------------------------------
         # 4. Central socket base
         # --------------------------------------------------------------
-        socket_inner = openmc.ZCylinder(
-            r=self.socket_radius
-        )
-        socket_outer = openmc.ZCylinder(
-            r=self.socket_external_radius
-        )
+
         socket_base_bottom = openmc.ZPlane(
             z0=self.socket_base_bottom
         )
@@ -560,6 +544,11 @@ class Vessel1L(Component):
         # --------------------------------------------------------------
         # 5. Central socket cylindrical wall
         # --------------------------------------------------------------
+
+        socket_inner = openmc.ZCylinder(
+            r=self.socket_radius
+        )
+
         socket_wall_region = (
             +socket_inner
             & -socket_outer
@@ -576,8 +565,9 @@ class Vessel1L(Component):
         )
 
         # --------------------------------------------------------------
-        # 6. Pipes, bolts and the third pipe's end cap
+        # 6. Pipes, hollow bolts, and solid caps
         # --------------------------------------------------------------
+
         pipe_bottom = openmc.ZPlane(
             z0=self.pipe_penetration_bottom
         )
@@ -595,49 +585,44 @@ class Vessel1L(Component):
             )
 
             pipe_top_z = self.lid_top + pipe_height
-
-            # The third pipe ends with a solid 0.3 cm cap.
-            if name == "ThirdPipe":
-                cap_thickness = 0.3
-                pipe_wall_top_z = pipe_top_z - cap_thickness
-            else:
-                pipe_wall_top_z = pipe_top_z
-
-            pipe_top = openmc.ZPlane(z0=pipe_wall_top_z)
-
-            pipe_wall_region = (
-                +pipe_inner
-                & -pipe_outer
-                & +pipe_bottom
-                & -pipe_top
+            pipe_wall_top_z = (
+                pipe_top_z - self.pipe_cap_thickness
             )
 
-            # Hollow bolt sleeve. Where it surrounds the pipe, the
-            # sleeve replaces the pipe wall rather than overlapping it.
-            bolt_inner_r = 0.5
-            bolt_bottom_z = self.lid_top + bolt_offset
-            bolt_top_z = bolt_bottom_z + bolt_height
+            pipe_wall_top = openmc.ZPlane(
+                z0=pipe_wall_top_z
+            )
 
+            # The bolt bore matches the pipe bore. This is the key fix:
+            # 0.50 cm for the twin pipes and 0.85 cm for the third pipe.
             bolt_inner = openmc.ZCylinder(
-                x0=x, y0=y, r=bolt_inner_r
+                x0=x, y0=y, r=inner_r
             )
             bolt_outer = openmc.ZCylinder(
                 x0=x, y0=y, r=bolt_outer_r
             )
-            bolt_bottom_plane = openmc.ZPlane(
-                z0=bolt_bottom_z
-            )
-            bolt_top_plane = openmc.ZPlane(
-                z0=bolt_top_z
-            )
+
+            bolt_bottom_z = self.lid_top + bolt_offset
+            bolt_top_z = bolt_bottom_z + bolt_height
+
+            bolt_bottom = openmc.ZPlane(z0=bolt_bottom_z)
+            bolt_top = openmc.ZPlane(z0=bolt_top_z)
 
             bolt_region = (
                 +bolt_inner
                 & -bolt_outer
-                & +bolt_bottom_plane
-                & -bolt_top_plane
+                & +bolt_bottom
+                & -bolt_top
             )
 
+            # Pipe wall is annular; remove the bolt's occupied region
+            # wherever the bolt sleeve overlaps the pipe wall.
+            pipe_wall_region = (
+                +pipe_inner
+                & -pipe_outer
+                & +pipe_bottom
+                & -pipe_wall_top
+            )
             pipe_wall_region &= ~bolt_region
 
             cells.append(
@@ -656,28 +641,29 @@ class Vessel1L(Component):
                 )
             )
 
-            # Solid circular cap at the end of the third pipe.
-            if name == "ThirdPipe":
-                cap_bottom = openmc.ZPlane(
-                    z0=pipe_wall_top_z
-                )
-                cap_top = openmc.ZPlane(
-                    z0=pipe_top_z
-                )
+            # Pipe bore intentionally remains void: no cell is added.
 
-                cap_region = (
-                    -pipe_outer
-                    & +cap_bottom
-                    & -cap_top
-                )
+            # Solid circular cap, 0.3 cm thick.
+            cap_bottom = openmc.ZPlane(
+                z0=pipe_wall_top_z
+            )
+            cap_top = openmc.ZPlane(
+                z0=pipe_top_z
+            )
 
-                cells.append(
-                    openmc.Cell(
-                        name=f"{self.name}_{name}_Cap",
-                        fill=self.material,
-                        region=cap_region,
-                    )
+            cap_region = (
+                -pipe_outer
+                & +cap_bottom
+                & -cap_top
+            )
+
+            cells.append(
+                openmc.Cell(
+                    name=f"{self.name}_{name}_Cap",
+                    fill=self.material,
+                    region=cap_region,
                 )
+            )
 
         return cells
     
