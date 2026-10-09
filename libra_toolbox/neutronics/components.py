@@ -5,7 +5,7 @@ import materials
 import numpy as np
 from scipy.optimize import brentq
 from scipy.integrate import quad
-from .materials import macor
+from materials import macor
 
 
 @dataclass(kw_only=True)
