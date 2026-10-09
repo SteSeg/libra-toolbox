@@ -21,12 +21,35 @@ class Component:
     rotation: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
+    @property
+    def reference_point(self) -> str:
+        return "Not specified"
+
+    @property
+    def local_axes_description(self) -> str:
+        return "Not specified"
+
+    def describe(self) -> str:
+        """Return a human-readable description of this component."""
+        return (
+            f"Component: {self.name}\n"
+            f"Reference point: {self.reference_point}\n"
+            f"Local origin: (0, 0, 0)\n"
+            f"Local axes: {self.local_axes_description}\n"
+            f"Geometry: Defined in local coordinates"
+        )
+
+
 @dataclass
 class LeadBrick(Component):
     width: float = 8.0
     length: float = 16.0
     height: float = 4.0
     material: openmc.Material = materials.Lead
+
+    @property
+    def reference_point(self):
+        return "Geometric center of the cuboid brick"
 
     def geometry(self):
         box = openmc.model.RectangularParallelepiped(
@@ -240,6 +263,14 @@ class Vessel1L(Component):
 
     # All three bolt sleeves are raised by this offset (cm)
     bolt_height_offset: float = 0.6
+
+    @property
+    def reference_point(self):
+        return "Center of the vessel bottom's bottom cylindricalsurface (z=0)."
+
+    @property
+    def local_axes_description(self) -> str:
+        return "+z points from the bottom toward the lid"
 
     # ------------------------------------------------------------------
     # Derived elevations
