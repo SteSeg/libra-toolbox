@@ -5,6 +5,7 @@ import materials
 import numpy as np
 from scipy.optimize import brentq
 from scipy.integrate import quad
+from .materials import macor
 
 
 @dataclass(kw_only=True)
@@ -791,7 +792,8 @@ class Vessel1L(Component):
         # Additional 0.6 cm lid, with the same openings as the original lid
         additional_lid_top_z = self.lid_top + 0.6
         additional_lid_top = openmc.ZPlane(z0=additional_lid_top_z)
-        additional_lid_material = self.material  # TODO: Use a different material for the additional lid?
+
+        additional_lid_material = macor
 
         additional_lid_region = (
             -outer_cyl
