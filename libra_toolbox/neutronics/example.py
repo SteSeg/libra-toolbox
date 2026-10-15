@@ -1,6 +1,7 @@
 import openmc
 from components import Breeder, HeadSpace, Vessel1L, BreederVessel1LAssembly
 from materials import Flibe_nat, Helium, Inconel625
+from vault import build_vault_model
 
 # Materials
 vessel_material = Inconel625
@@ -33,12 +34,31 @@ assembly = BreederVessel1LAssembly(
     headspace=headspace,
 )
 
-# Build OpenMC cells
-cells = assembly.geometry()
+# # Build OpenMC cells
+# cells = assembly.geometry()
 
-# OpenMC geometry
-geometry = openmc.Geometry(cells)
+# # OpenMC geometry
+# geometry = openmc.Geometry(cells)
 
-# model
-model = openmc.model.Model(geometry=geometry)
+# # model
+# model = openmc.model.Model(geometry=geometry)
+# model.export_to_model_xml()
+
+settings = openmc.Settings()
+tallies = openmc.Tallies()
+
+
+model = build_vault_model(
+    settings=settings,
+    tallies=tallies,
+    experiment_placements=[
+        {
+            "assembly": assembly,
+            "position": (500.0, 300.0, 10.16),
+            "rotation": (0.0, 0.0, 45.0),
+            "envelope_radius": 30.0,
+        }
+    ],
+)
+
 model.export_to_model_xml()
