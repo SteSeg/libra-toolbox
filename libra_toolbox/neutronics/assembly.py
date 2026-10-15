@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from .components import Component
+from .components import *
+import openmc
 
 
 @dataclass
@@ -79,3 +80,38 @@ class Assembly:
                 )
 
         return "\n".join(lines)
+    
+
+@dataclass
+class BreederVessel1LAssembly:
+    name: str
+    vessel: Vessel1L
+    breeder: Breeder
+    headspace: HeadSpace
+
+    def geometry(self):
+        # Vessel structure
+        vessel_cells = self.vessel.geometry()
+
+        # Breeder region inside the vessel
+        breeder_region = self.breeder.region(self.vessel)
+
+        breeder_cell = openmc.Cell(
+            name=self.breeder.name,
+            region=breeder_region,
+            fill=self.breeder.material,
+        )
+
+        # Everything inside the vessel not occupied by breeder
+        headspace_region = self.vessel.fill_region & ~breeder_region
+
+        headspace_cell = openmc.Cell(
+            name=self.headspace.name,
+            region=headspace_region,
+            fill=self.headspace.material,
+        )
+
+        return vessel_cells + [
+            breeder_cell,
+            headspace_cell,
+        ]

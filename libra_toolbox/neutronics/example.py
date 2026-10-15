@@ -1,5 +1,6 @@
 import openmc
-from components import Breeder, HeadSpace, Vessel1L, BreederVessel1LAssembly
+from components import Breeder, HeadSpace, Vessel1L
+from assemblies import BreederVessel1LAssembly
 from materials import Flibe_nat, Helium, Inconel625
 from vault import build_vault_model
 
