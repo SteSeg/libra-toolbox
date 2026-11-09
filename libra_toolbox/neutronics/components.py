@@ -40,6 +40,98 @@ class Component:
         )
 
 
+class A325Tube(Component):
+    """Hollow cylindrical source tube with a neutron-source reference point."""
+
+    def __init__(
+        self,
+        name="SourceTube",
+        material=None,
+        length=50.0,
+        outer_radius=5.0,
+        inner_radius=4.75,
+        end_cap_thickness=0.25,
+        source_position=13.5,
+    ):
+        self.name = name
+        self.material = material
+        self.length = length
+        self.outer_radius = outer_radius
+        self.inner_radius = inner_radius
+        self.end_cap_thickness = end_cap_thickness
+        self.source_position = source_position
+
+        if length <= 0:
+            raise ValueError("Tube length must be positive.")
+        if outer_radius <= 0:
+            raise ValueError("Outer radius must be positive.")
+        if not 0 < inner_radius < outer_radius:
+            raise ValueError("Inner radius must be between zero and outer radius.")
+        if not 0 <= end_cap_thickness < length / 2:
+            raise ValueError("End-cap thickness must be non-negative and less than half the tube length.")
+        if not end_cap_thickness <= source_position <= length - end_cap_thickness:
+            raise ValueError("Source position must lie within the internal tube length.")
+
+    @property
+    def reference_point(self):
+        return (
+            f"Neutron source position, {self.source_position} cm "
+            "from the negative-z end of the tube"
+        )
+
+    @property
+    def local_axes_description(self):
+        return "+z along the tube axis; neutron source at the local origin"
+
+    def geometry(self):
+        # Tube boundaries relative to the neutron source position
+        z_min = -self.source_position
+        z_max = self.length - self.source_position
+
+        outer_cylinder = openmc.ZCylinder(r=self.outer_radius)
+        inner_cylinder = openmc.ZCylinder(r=self.inner_radius)
+
+        outer_z_min = openmc.ZPlane(z0=z_min)
+        outer_z_max = openmc.ZPlane(z0=z_max)
+
+        inner_z_min = openmc.ZPlane(
+            z0=z_min + self.end_cap_thickness
+        )
+        inner_z_max = openmc.ZPlane(
+            z0=z_max - self.end_cap_thickness
+        )
+
+        # Outer tube envelope
+        outer_region = (
+            -outer_cylinder
+            & +outer_z_min
+            & -outer_z_max
+        )
+
+        # Internal vacuum region
+        vacuum_region = (
+            -inner_cylinder
+            & +inner_z_min
+            & -inner_z_max
+        )
+
+        # Tube wall, including end caps
+        wall_region = outer_region & ~vacuum_region
+
+        wall_cell = openmc.Cell(
+            name=f"{self.name} - Wall",
+            region=wall_region,
+            fill=self.material,
+        )
+
+        vacuum_cell = openmc.Cell(
+            name=f"{self.name} - Vacuum",
+            region=vacuum_region,
+            fill=None,
+        )
+
+        return [wall_cell, vacuum_cell]
+
 @dataclass
 class LeadBrick(Component):
     width: float = 8.0
@@ -189,17 +281,26 @@ class Heater(Component):
     height: float = 25.40
     material: openmc.Material = materials.Heater_mat
 
-    def geometry(self):
-        cylinder = openmc.ZCylinder(r=self.radius)
+    @property
+    def reference_point(self) -> str:
+        return "Center of the bottom circular face"
 
+    @property
+    def local_axes_description(self) -> str:
+        return "+z along the heater axis; +x and +y in the bottom plane"
+
+    @property
+    def region(self):
+        cylinder = openmc.ZCylinder(r=self.radius)
         bottom = openmc.ZPlane(z0=0.0)
         top = openmc.ZPlane(z0=self.height)
 
-        region = +bottom & -top & -cylinder
+        return +bottom & -top & -cylinder
 
+    def geometry(self):
         cell = openmc.Cell(
             name=self.name,
-            region=region,
+            region=self.region,
             fill=self.material,
         )
 
@@ -887,6 +988,17 @@ class Breeder(Component):
 
         return vessel.fill_region & +bottom & -top
 
+    @property
+    def occupied_region(self):
+        """Union of all solid regions occupied by the vessel and its fittings."""
+        cells = self.geometry()
+
+        region = cells[0].region
+        for cell in cells[1:]:
+            region |= cell.region
+
+        return region
+
 @dataclass
 class HeadSpace:
     name: str
@@ -906,39 +1018,43 @@ class OuterVessel(Component):
 
     material: openmc.Material = None
 
+    @property
+    def reference_point(self) -> str:
+        return "Center of the inner face of the bottom plate"
+
+    @property
+    def local_axes_description(self) -> str:
+        return "+z along the vessel axis; +x and +y in the bottom plane"
+
+    @property
+    def fill_region(self):
+        """Internal volume available for other components."""
+        inner = openmc.ZCylinder(r=self.inner_radius)
+        bottom = openmc.ZPlane(z0=0.0)
+        top = openmc.ZPlane(z0=self.height)
+
+        return -inner & +bottom & -top
+
     def geometry(self):
-        # Main cylindrical wall
         inner = openmc.ZCylinder(r=self.inner_radius)
         outer = openmc.ZCylinder(r=self.outer_radius)
 
-        bottom = openmc.ZPlane(z0=0.0)
-        wall_bottom = openmc.ZPlane(z0=self.bottom_thickness)
-        wall_top = openmc.ZPlane(
-            z0=self.bottom_thickness + self.height
-        )
-        top = openmc.ZPlane(
-            z0=self.bottom_thickness
-            + self.height
-            + self.top_thickness
-        )
+        bottom = openmc.ZPlane(z0=-self.bottom_thickness)
+        wall_bottom = openmc.ZPlane(z0=0.0)
+        wall_top = openmc.ZPlane(z0=self.height)
+        top = openmc.ZPlane(z0=self.height + self.top_thickness)
 
         wall_region = (
-            +wall_bottom
-            & -wall_top
-            & +inner
-            & -outer
+            +wall_bottom & -wall_top
+            & +inner & -outer
         )
 
         bottom_region = (
-            +bottom
-            & -wall_bottom
-            & -outer
+            +bottom & -wall_bottom & -outer
         )
 
         top_region = (
-            +wall_top
-            & -top
-            & -outer
+            +wall_top & -top & -outer
         )
 
         region = wall_region | bottom_region | top_region
